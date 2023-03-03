@@ -20,6 +20,7 @@
 *.data
 *.json
 *.cfg
+*.env
 !setup.cfg
 !cfg/yolov3*.cfg
 
@@ -36,6 +37,8 @@ data/images/*
 !data/*.sh
 
 results*.csv
+
+streams.txt
 
 # Datasets -------------------------------------------------------------------------------------------------------------
 coco/
@@ -54,7 +57,7 @@ val2017.zip
 
 # Neural Network weights -----------------------------------------------------------------------------------------------
 *.weights
-*.pt
+traced_model.pt
 *.pb
 *.onnx
 *.engine
