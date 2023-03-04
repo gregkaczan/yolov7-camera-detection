@@ -98,8 +98,18 @@ def detect(save_img=False):
             pred = model(img, augment=opt.augment)[0]
         t2 = time_synchronized()
 
+        classesToDetect = [
+            0, # person
+            1, # bicycle
+            2, # car
+            3, # motorcycle
+            5, # bus
+            #6, # train
+            7, # truck
+        ]
+
         # Apply NMS
-        pred = non_max_suppression(pred, opt.conf_thres, opt.iou_thres, classes=opt.classes, agnostic=opt.agnostic_nms)
+        pred = non_max_suppression(pred, opt.conf_thres, opt.iou_thres, classes=classesToDetect, agnostic=opt.agnostic_nms)
         t3 = time_synchronized()
 
         # Apply Classifier
