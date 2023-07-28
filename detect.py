@@ -1,11 +1,16 @@
 import argparse
 import time
 from pathlib import Path
-
+import atexit
+import sys
+import signal
 import cv2
 import torch
 import torch.backends.cudnn as cudnn
 from numpy import random
+import json
+import paho.mqtt.client as mqtt
+import requests
 
 from models.experimental import attempt_load
 from utils.datasets import LoadStreams, LoadImages
@@ -18,6 +23,18 @@ from dotenv import dotenv_values
 
 config = dotenv_values("creds.env")
 
+# 0 - disarmed
+# 1 - armed
+IS_ALARM_ARMED = 0
+
+cameras = {
+    1: "FrontTop",
+    2: "BackTop",
+    3: "Driveway",
+    4: "Salon",
+    5: "Back"
+}
+
 email = EmailSender(
     host='smtp.gmail.com',
     port='587',
@@ -25,11 +42,27 @@ email = EmailSender(
     password=config['EMAIL_PASS']
 )
 
+def on_connect(client, userdata, flags, rc):
+    if rc == 0:
+        print("Connected to MQTT broker!")
+    else:
+        print(f"Connection failed with error code {rc}")
+
+# Mosquitto MQTT broker
+broker_address = "192.168.1.30"
+client = mqtt.Client()
+client.on_connect = on_connect
+
+client.connect(broker_address)
+client.loop_start()
+
 def detect(save_img=False):
     source, weights, view_img, save_txt, imgsz, trace = opt.source, opt.weights, opt.view_img, opt.save_txt, opt.img_size, not opt.no_trace
     save_img = not opt.nosave and not source.endswith('.txt')  # save inference images
     webcam = source.isnumeric() or source.endswith('.txt') or source.lower().startswith(
         ('rtsp://', 'rtmp://', 'http://', 'https://'))
+
+    print('start detect')
 
     # Directories
     save_dir = Path(increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok))  # increment run
@@ -59,6 +92,7 @@ def detect(save_img=False):
 
     # Set Dataloader
     vid_path, vid_writer = None, None
+    print(f'source {source}')
     if webcam:
         view_img = check_imshow()
         cudnn.benchmark = True  # set True to speed up constant image size inference
@@ -75,9 +109,10 @@ def detect(save_img=False):
         model(torch.zeros(1, 3, imgsz, imgsz).to(device).type_as(next(model.parameters())))  # run once
     old_img_w = old_img_h = imgsz
     old_img_b = 1
-
     t0 = time.time()
+    
     for path, img, im0s, vid_cap in dataset:
+        client.publish("alarm/is_armed", 1, qos = 2)
         img = torch.from_numpy(img).to(device)
         img = img.half() if half else img.float()  # uint8 to fp16/32
         img /= 255.0  # 0 - 255 to 0.0 - 1.0
@@ -152,28 +187,48 @@ def detect(save_img=False):
 
                 # Save results (image with detections)
                 cv2.imwrite(save_path, im0)
-                print("Sending email")
-                email.send(
-                    sender=config['EMAIL_SENDER'],
-                    subject="Camera detected: " + s,
-                    receivers = [config['EMAIL_SENDER']],
-                    html="""
-                        {{ myimage }}
-                    """,
-                    body_images={
-                        'myimage': save_path
-                    },
-                )
+
+                with open(save_path, "rb") as image_file:
+                    image_data = image_file.read()
+                    # PUSH MSG to MQTT
+                    data = {
+                        "img": image_data,
+                        "str": s
+                    }
+                    
+                    client.publish("alarm/detected", image_data, qos = 2)
+                
+
+                print(f'INTRUDER: {s}')
+
+                
+                # with open(save_path, 'rb') as image_file:
+                #     files = {'file': ('image.jpg', image_file)}
+                #     print("Notify NodeRed")
+                #     files = {'file': ('image.jpg', save_path)}
+                #     requests.post(url, files=files)
+                
+
+                # email.send(
+                #     sender=config['EMAIL_SENDER'],
+                #     subject="Camera detected: " + s,
+                #     receivers = [config['EMAIL_SENDER']],
+                #     html="""
+                #         {{ myimage }}
+                #     """,
+                #     body_images={
+                #         'myimage': save_path
+                #     },
+                # )
 
             # Print time (inference + NMS)
-            print(f'{s}Done. ({(1E3 * (t2 - t1)):.1f}ms) Inference, ({(1E3 * (t3 - t2)):.1f}ms) NMS')
+            print(f'{s}Done. ({(1E3 * (t2 - t1)):.1f}ms) Inference, ({(1E3 * (t3 - t2)):.1f}ms) NMS {str(p)}')
 
             # Stream results
-            if view_img:
-                cv2.imshow(str(p), im0)
-                cv2.waitKey(1000)  # 1 millisecond
-
-            
+            # if view_img:
+            #     cv2.imshow(str(p), im0)
+            #     cv2.waitKey(100)  # 1 millisecond
+            time.sleep(0.2)
                 
 
     if save_txt or save_img:
@@ -182,13 +237,32 @@ def detect(save_img=False):
 
     print(f'Done. ({time.time() - t0:.3f}s)')
 
+def cleanup():
+    msg = client.publish("alarm/is_armed", 0, qos = 2)
+    msg.wait_for_publish(10)
+    print(f"Is disarm published: {msg.is_published}")
+    print(f"Cleanup at exit: detect.py")
+
+# Register the cleanup function to run when the script exits
+atexit.register(cleanup)
+
+def signal_handler(sig, frame):
+    msg = client.publish("alarm/is_armed", 0, qos = 2)
+    msg.wait_for_publish(10)
+    print("Termination signal received. Exiting...")
+    sys.exit(0)
+
+# Catch termination signals and perform cleanup
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--weights', nargs='+', type=str, default='yolov7.pt', help='model.pt path(s)')
-    parser.add_argument('--source', type=str, default='inference/images', help='source')  # file/folder, 0 for webcam
+    parser.add_argument('--source', type=str, default='streams.txt', help='source')  # file/folder, 0 for webcam
     parser.add_argument('--img-size', type=int, default=640, help='inference size (pixels)')
-    parser.add_argument('--conf-thres', type=float, default=0.25, help='object confidence threshold')
+    parser.add_argument('--conf-thres', type=float, default=0.85, help='object confidence threshold')
     parser.add_argument('--iou-thres', type=float, default=0.45, help='IOU threshold for NMS')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--view-img', action='store_true', help='display results')
